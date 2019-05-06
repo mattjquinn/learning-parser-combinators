@@ -2,6 +2,25 @@ type ParseResult<'a, Output> = Result<(&'a str, Output), &'a str>;
 
 trait Parser<'a, Output> {
     fn parse(&self, input: &'a str) -> ParseResult<'a, Output>;
+
+    fn map<F, NewOutput>(self, map_fn: F) -> BoxedParser<'a, NewOutput>
+    where
+        Self: Sized + 'a,
+        Output: 'a,
+        NewOutput: 'a,
+        F: Fn(Output) -> NewOutput + 'a,
+    {
+        BoxedParser::new(map(self, map_fn))
+    }
+
+    fn pred<F>(self, pred_fn: F) -> BoxedParser<'a, Output>
+    where
+        Self: Sized + 'a,
+        Output: 'a,
+        F: Fn(&Output) -> bool + 'a,
+    {
+        BoxedParser::new(pred(self, pred_fn))
+    }
 }
 
 impl<'a, F, Output> Parser<'a, Output> for F
@@ -9,6 +28,27 @@ impl<'a, F, Output> Parser<'a, Output> for F
 {
     fn parse(&self, input: &'a str) -> ParseResult<'a, Output> {
         self(input)
+    }
+}
+
+struct BoxedParser<'a, Output> {
+    parser: Box<dyn Parser<'a, Output> + 'a>,
+}
+
+impl<'a, Output> BoxedParser<'a, Output> {
+    fn new<P>(parser: P) -> Self
+    where
+        P: Parser<'a, Output> + 'a,
+    {
+        BoxedParser {
+            parser: Box::new(parser),
+        }
+    }
+}
+
+impl<'a, Output> Parser<'a, Output> for BoxedParser<'a, Output> {
+    fn parse(&self, input: &'a str) -> ParseResult<'a, Output> {
+        self.parser.parse(input)
     }
 }
 
@@ -178,10 +218,44 @@ fn space0<'a>() -> impl Parser<'a, Vec<char>> {
     zero_or_more(whitespace_char())
 }
 
+fn quoted_string<'a>() -> impl Parser<'a, String> {
+    right(
+        match_literal("\""),
+        left(
+            zero_or_more(any_char.pred(|c| *c != '"')),
+            match_literal("\""),
+        ),
+    ).map(|chars| chars.into_iter().collect())
+}
+
+fn attribute_pair<'a>() -> impl Parser<'a, (String, String)> {
+    pair(identifier, right(match_literal("="), quoted_string()))
+}
+
+fn attributes<'a>() -> impl Parser<'a, Vec<(String, String)>> {
+    zero_or_more(right(space1(), attribute_pair()))
+}
+
+fn element_start<'a>()
+    -> impl Parser<'a, (String, Vec<(String, String)>)> {
+   right(match_literal("<"), pair(identifier, attributes()))
+}
+
+fn single_element<'a>() -> impl Parser<'a, Element> {
+    left(element_start(), match_literal("/>"))
+        .map(|(name, attributes)| Element {
+            name,
+            attributes,
+            children: vec![],
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{match_literal, identifier, pair, left, right, Parser,
-    one_or_more, zero_or_more, pred, any_char};
+    one_or_more, zero_or_more, pred, any_char, quoted_string, attributes,
+    Element, single_element};
 
     #[test]
     fn literal_parser() {
@@ -249,5 +323,43 @@ mod tests {
         let parser = pred(any_char, |c| *c == 'o');
         assert_eq!(Ok(("mg", 'o')), parser.parse("omg"));
         assert_eq!(Err("lol"), parser.parse("lol"));
+    }
+
+    #[test]
+    fn quoted_string_parser() {
+        assert_eq!(
+            Ok(("", "Hello Joe!".to_string())),
+                quoted_string().parse("\"Hello Joe!\"")
+        )
+    }
+
+    #[test]
+    fn attribute_parser() {
+        assert_eq!(
+            Ok((
+                "",
+                vec![
+                    ("one".to_string(), "1".to_string()),
+                    ("two".to_string(), "2".to_string())
+                ]
+            )),
+            attributes().parse(" one=\"1\" two=\"2\"")
+        );
+    }
+
+    #[test]
+    fn single_element_parser() {
+        assert_eq!(
+            Ok((
+                "",
+                Element {
+                    name: "div".to_string(),
+                    attributes: vec![("class".to_string(),
+                        "float".to_string())],
+                    children: vec![]
+                }
+            )),
+            single_element().parse("<div class=\"float\"/>")
+        );
     }
 }
